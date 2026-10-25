@@ -1,0 +1,38 @@
+name: Build CloudStream plugin
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build plugin
+        run: gradle DonghuaFlix:make makePluginsJson
+      - name: Publish builds branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cs-build
+          find . -type f \( -name '*.cs3' -o -name 'plugins.json' \) -exec cp {} /tmp/cs-build/ \;
+          sed "s|TU_USUARIO|${GITHUB_REPOSITORY%%/*}|g" repo.json > /tmp/cs-build/repo.json
+          cd /tmp/cs-build
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b builds
+          git add .
+          git commit -q -m "Publish CloudStream plugin"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin builds
