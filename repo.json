@@ -1,0 +1,8 @@
+{
+  "name": "DonghuaFlix CloudStream",
+  "description": "Catálogos híbridos de DonghuaFlix con consulta de fuentes autorizadas",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/TU_USUARIO/donghuaflix-cloudstream/builds/plugins.json"
+  ]
+}
