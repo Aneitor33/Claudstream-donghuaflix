@@ -34,7 +34,7 @@ subprojects {
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     cloudstream {
-        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "Aneitor33/donghuaflix-cloudstream")
+        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "Aneitor33/Claudstream-donghuaflix")
     }
 
     android {
@@ -59,11 +59,12 @@ subprojects {
     }
 
     dependencies {
-        val apk by configurations
+        // El plugin actual registra la configuracion "cloudstream"
+        // (en versiones antiguas se llamaba "apk").
+        val cloudstream by configurations
         val implementation by configurations
 
-        // Stubs/API de CloudStream
-        apk("com.lagradost:cloudstream3:pre-release")
+        cloudstream("com.lagradost:cloudstream3:pre-release")
 
         implementation(kotlin("stdlib"))
         implementation("org.jsoup:jsoup:1.16.2")
