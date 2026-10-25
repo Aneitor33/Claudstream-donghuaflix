@@ -16,7 +16,7 @@ jobs:
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.14'
       - name: Build plugin
         run: gradle DonghuaFlix:make makePluginsJson
       - name: Publish builds branch
