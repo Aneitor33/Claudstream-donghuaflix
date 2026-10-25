@@ -63,7 +63,7 @@ class DonghuaFlixProvider : MainAPI() {
     // ── Utilidades ───────────────────────────────────────────────────────
 
     private suspend fun getText(url: String): String? = try {
-        app.get(url, timeout = 20).text
+        app.get(url).text
     } catch (_: Exception) {
         null
     }
@@ -201,7 +201,7 @@ class DonghuaFlixProvider : MainAPI() {
     }
 
     private fun card(e: Entry, idx: Index): SearchResponse =
-        newAnimeSearchResponse(e.title, "$mainUrl/dfx/${idx.catalog.id}/${e.slug}", typeOf(e, idx)) {
+        newMovieSearchResponse(e.title, "$mainUrl/dfx/${idx.catalog.id}/${e.slug}", typeOf(e, idx)) {
             posterUrl = e.poster
         }
 
@@ -226,7 +226,7 @@ class DonghuaFlixProvider : MainAPI() {
             throw ErrorLoadingException("Catálogo vacío: ${idx.catalog.label}")
         }
         return newHomePageResponse(
-            listOf(HomePageList(idx.catalog.label, items)),
+            HomePageList(idx.catalog.label, items),
             hasNext = from + pageSize < idx.entries.size,
         )
     }
@@ -256,7 +256,7 @@ class DonghuaFlixProvider : MainAPI() {
             if (out.size >= 40) break
             val base = idx.sourceBase ?: continue
             val doc = try {
-                app.get("$base/?s=" + URLEncoder.encode(query, "UTF-8"), timeout = 12).document
+                app.get("$base/?s=" + URLEncoder.encode(query, "UTF-8")).document
             } catch (_: Exception) {
                 continue
             }
@@ -268,7 +268,7 @@ class DonghuaFlixProvider : MainAPI() {
                 if (!href.startsWith("http") || title.isBlank()) continue
                 if (href.trimEnd('/') == base.trimEnd('/')) continue
                 if (out.containsKey(href)) continue
-                out[href] = newAnimeSearchResponse(title, href, TvType.TvSeries) {
+                out[href] = newMovieSearchResponse(title, href, TvType.TvSeries) {
                     posterUrl = a.selectFirst("img")?.let {
                         it.absUrl("data-src").ifBlank { it.absUrl("src") }
                     }?.takeIf { it.startsWith("http") }
@@ -455,7 +455,7 @@ class DonghuaFlixProvider : MainAPI() {
 
     private suspend fun loadFromSource(url: String): LoadResponse? {
         val doc = try {
-            app.get(url, timeout = 18).document
+            app.get(url).document
         } catch (_: Exception) {
             return null
         }
@@ -535,7 +535,7 @@ class DonghuaFlixProvider : MainAPI() {
     ): Int {
         if (depth > 1) return 0
         val doc = try {
-            app.get(pageUrl, timeout = 18).document
+            app.get(pageUrl).document
         } catch (_: Exception) {
             return 0
         }
@@ -545,7 +545,7 @@ class DonghuaFlixProvider : MainAPI() {
         doc.select("track[kind=subtitles][src], track[src]").forEach { t ->
             val src = t.absUrl("src")
             if (src.startsWith("http")) {
-                subtitleCallback(SubtitleFile(url = src, name = t.attr("label").ifBlank { "Subtítulos" }))
+                subtitleCallback(SubtitleFile(url = src, lang = "es", headers = emptyMap()))
             }
         }
 
@@ -594,7 +594,7 @@ class DonghuaFlixProvider : MainAPI() {
         return count
     }
 
-    private fun emit(u: String, referer: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun emit(u: String, referer: String, callback: (ExtractorLink) -> Unit) {
         val type = when {
             u.contains(".m3u8", true) -> ExtractorLinkType.M3U8
             u.contains(".mpd", true) -> ExtractorLinkType.DASH
