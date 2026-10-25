@@ -8,8 +8,8 @@ buildscript {
         maven("https://jitpack.io")
     }
     dependencies {
-        // Alineado con la era Kotlin 2.4 / AGP 8.13:
-        // los classes.jar de CloudStream pre-release usan Kotlin 2.4.0.
+        // Versiones alineadas con la era Kotlin 2.4 / AGP 8.13 (los classes.jar
+        // de CloudStream pre-release se compilan con Kotlin 2.4.0).
         classpath("com.android.tools.build:gradle:8.13.0")
         classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.0")
@@ -64,7 +64,9 @@ subprojects {
         cloudstream("com.lagradost:cloudstream3:pre-release")
 
         implementation(kotlin("stdlib"))
-        implementation("org.jsoup:jsoup:1.16.2")
+        // 'document' y demás helpers HTTP viven en NiceHttp en la API actual
+        implementation("com.github.Blatzar:NiceHttp:0.4.11")
+        implementation("org.jsoup:jsoup:1.18.1")
         implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     }
 }
