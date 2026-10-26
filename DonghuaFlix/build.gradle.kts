@@ -1,4 +1,4 @@
-version = 2
+version = 4
 
 cloudstream {
     description = "Catálogos híbridos de DonghuaFlix: Donghua Life, DonghuaSub, Doramas, Dramas YouTube, YouTube Films y PelisPedia"
