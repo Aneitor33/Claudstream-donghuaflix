@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import org.jsoup.Jsoup
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -24,9 +25,9 @@ class DonghuaFlixProvider : MainAPI() {
     // La web desplegada no sirve /data (la SPA responde HTML): el proveedor
     // lee los JSON del repositorio, con jsDelivr de espejo.
     private val dataBases = listOf(
+        "https://donghuaflix.pages.dev/public/data",
         "https://raw.githubusercontent.com/Aneitor33/donghuaflix/main/public/data",
         "https://cdn.jsdelivr.net/gh/Aneitor33/donghuaflix@main/public/data",
-        "https://donghuaflix.pages.dev/data",
     )
 
     @Volatile
@@ -288,7 +289,7 @@ class DonghuaFlixProvider : MainAPI() {
         val idx = catalogs().firstOrNull { it.catalog.id == catId } ?: return null
         val entry = idx.entries.firstOrNull { it.slug == slug || it.id == slug } ?: return null
 
-        findDetail(idx, slug)?.let { return buildFromDetail(it, entry, idx, url) }
+        findDetail(idx, slug, entry.id)?.let { return buildFromDetail(it, entry, idx, url) }
         sourcePage(idx, slug)?.let { return loadFromSource(it) }
 
         return newMovieLoadResponse(entry.title, url, typeOf(entry, idx), url) {
@@ -296,18 +297,24 @@ class DonghuaFlixProvider : MainAPI() {
         }
     }
 
-    private suspend fun findDetail(idx: Index, slug: String): Detail? {
+    /** Mismo hash que app.js de DonghuaFlix: h*31 en 32 bits, |h| % 64. */
+    private fun shardIndexOf(key: String): Int {
+        var h = 0L
+        for (c in key) h = (h * 31 + c.code) and 0xFFFFFFFFL
+        if (h >= 0x80000000L) h -= 0x100000000L
+        return (kotlin.math.abs(h) % 64L).toInt()
+    }
+
+    private suspend fun findDetail(idx: Index, slug: String, idHint: String): Detail? {
         detailCache["${idx.catalog.id}/$slug"]?.let { return it }
-        val found = scanDetail(idx, slug)
+        val found = scanDetail(idx, slug, idHint)
         if (found != null && detailCache.size < detailCacheMax) {
             detailCache["${idx.catalog.id}/$slug"] = found
         }
         return found
     }
 
-    private suspend fun scanDetail(idx: Index, slug: String): Detail? = coroutineScope {
-        // 1) Detalle individual: algunos catálogos publican <slug>.json cuya
-        //    raíz es {series: {...}, seasons: [...], episodes: [...]}
+    private suspend fun scanDetail(idx: Index, slug: String, idHint: String): Detail? = coroutineScope {
         if ('/' !in slug) {
             getData("${idx.detailsBase}/$slug.json")?.let { text ->
                 (parseJson(text) as? JSONObject)?.let { root ->
@@ -315,16 +322,22 @@ class DonghuaFlixProvider : MainAPI() {
                 }
             }
         }
-        // 2) Shards: la raíz de cada shard es
-        //    {series: [...], seasons: [...], episodes: [...]}
-        //    y los episodios/seasons se filtran por seriesId == slug.
+        // 1) Shards dirigidos por hash (igual que app.js: shardIndexOf)
+        val tried = LinkedHashSet<Int>()
+        for (key in listOf(slug, idHint)) {
+            val s = shardIndexOf(key)
+            if (tried.add(s)) {
+                shardDetail(idx, s, slug)?.let { return@coroutineScope it }
+            }
+        }
+        // 2) Respaldo: oleadas por el resto por si el hash difiere
         var result: Detail? = null
         var n = 0
         while (n < maxShards && result == null) {
             val upper = minOf(n + shardWave, maxShards)
-            val deferreds = (n until upper).map {
-                async { getData("${idx.detailsBase}/shard-$it.json") }
-            }
+            val deferreds = (n until upper)
+                .filter { it !in tried }
+                .map { async { getData("${idx.detailsBase}/shard-$it.json") } }
             for (d in deferreds) {
                 if (result != null) break
                 val text = d.await()
@@ -337,6 +350,13 @@ class DonghuaFlixProvider : MainAPI() {
             n = upper
         }
         result
+    }
+
+    private suspend fun shardDetail(idx: Index, i: Int, slug: String): Detail? {
+        val text = getData("${idx.detailsBase}/shard-$i.json") ?: return null
+        val root = parseJson(text) as? JSONObject ?: return null
+        val series = detailIn(root, slug) ?: return null
+        return Detail(series, root)
     }
 
     private val arrayKeys = listOf("series", "items", "entries", "data")
@@ -569,9 +589,24 @@ class DonghuaFlixProvider : MainAPI() {
                     }
                 }
                 emitted += scrape(url, depth, subtitleCallback, callback)
+                if (emitted == 0) emitted += tryDownloadVariants(url, callback)
             }
         }
         return emitted
+    }
+
+    /** Si el player no revela nada, deriva las URL de descarga (/d/, /download/)
+     *  a partir de la URL de player (/e/ID, /v/ID) y prueba el formulario. */
+    private suspend fun tryDownloadVariants(u: String, callback: (ExtractorLink) -> Unit): Int {
+        val m = Regex("""https?://([^/]+)/(?:e|v|embed)/([\w-]+)/?$""").find(u) ?: return 0
+        val host = m.groupValues[1]
+        val id = m.groupValues[2]
+        if (id.length < 4) return 0
+        var count = 0
+        count += extractDownloadPage("https://$host/d/$id", callback)
+        if (count == 0) count += extractDownloadPage("https://$host/download/$id", callback)
+        if (count == 0) count += extractDownloadPage("https://$host/$id/download", callback)
+        return count
     }
 
     private fun normalizeYoutube(u: String): String = when {
@@ -673,32 +708,51 @@ class DonghuaFlixProvider : MainAPI() {
      * en el HTML/JS. Los candidatos se resuelven recursivamente (límite de
      * profundidad) pasando por los extractores registrados de CloudStream.
      */
-    /** Páginas de descarga de Streamwish/Earnvids/VidHide: el mp4 directo
-     *  sale de un formulario con token (op=download1). */
+    /** Páginas de descarga de Streamwish/Earnvids/VidHide: baile de
+     *  formularios (op=download1 -> op=download2) hasta revelar el enlace
+     *  firmado (#download_link). El enlace va firmado para la IP que pide. */
     private suspend fun extractDownloadPage(u: String, callback: (ExtractorLink) -> Unit): Int {
-        val page = getText(u) ?: return 0
-        var count = grepMedia(page, u, callback)
+        var page = getText(u) ?: return 0
+        var current = u
+        var count = grepMedia(page, current, callback)
         if (count > 0) return count
 
-        val op = Regex("""name=["']op["'][^>]*value=["']([^"']+)""").find(page)?.groupValues?.get(1)
-            ?: "download1"
-        val token = Regex("""name=["']token["'][^>]*value=["']([^"']+)""").find(page)?.groupValues?.get(1)
-        if (token == null) return 0
-
-        return try {
-            val html = app.post(u, data = mapOf("op" to op, "token" to token)).text
-            var n = grepMedia(html, u, callback)
-            Regex("""id=["']download_link["'][^>]*href=["']([^"']+)""").find(html)?.let { m ->
-                val link = m.groupValues[1].replace("&amp;", "&")
-                if (link.startsWith("http")) {
-                    emit(link, u, callback)
-                    n++
+        repeat(2) { step ->
+            val doc = Jsoup.parse(page, current)
+            doc.selectFirst("#download_link")?.let { a ->
+                val href = a.absUrl("href").replace("&amp;", "&")
+                if (href.startsWith("http")) {
+                    emit(href, current, callback)
+                    return count + 1
                 }
             }
-            n
-        } catch (_: Exception) {
-            0
+            val form = doc.selectFirst("form") ?: return 0
+            val action = form.absUrl("action").ifBlank { current }
+            val data = LinkedHashMap<String, String>()
+            form.select("input[name]").forEach { inp ->
+                data[inp.attr("name")] = inp.attr("value")
+            }
+            if (data.isEmpty()) return 0
+            if (!data.containsKey("op")) data["op"] = "download${step + 1}"
+
+            page = try {
+                app.post(action, data = data).text
+            } catch (_: Exception) {
+                return 0
+            }
+            current = action
+            count = grepMedia(page, current, callback)
+            if (count > 0) return count
         }
+
+        Jsoup.parse(page, current).selectFirst("#download_link")?.let { a ->
+            val href = a.absUrl("href").replace("&amp;", "&")
+            if (href.startsWith("http")) {
+                emit(href, current, callback)
+                return count + 1
+            }
+        }
+        return 0
     }
 
     /** Busca m3u8/mp4 embebidos en un HTML (players tipo player.js). */
@@ -792,9 +846,12 @@ class DonghuaFlixProvider : MainAPI() {
         return count
     }
 
-    private fun isPlayerPath(u: String): Boolean =
-        u.contains("/embed/", true) || u.contains("/e/", true) ||
-                u.contains("player", true) || u.contains("/video/", true)
+    private fun isPlayerPath(u: String): Boolean {
+        if (u.contains("/embed/", true) || u.contains("/e/", true) ||
+            u.contains("player", true) || u.contains("/video/", true)
+        ) return true
+        return Regex("""/(?:v|d|download)/[\w-]{5,}""", RegexOption.IGNORE_CASE).containsMatchIn(u)
+    }
 
     private suspend fun emit(
         u: String,
