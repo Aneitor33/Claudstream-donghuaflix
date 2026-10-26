@@ -380,7 +380,7 @@ class DonghuaFlixProvider : MainAPI() {
         return null
     }
 
-    private fun buildFromDetail(
+    private suspend fun buildFromDetail(
         d: JSONObject,
         entry: Entry,
         idx: Index,
@@ -540,14 +540,6 @@ class DonghuaFlixProvider : MainAPI() {
             return 0
         }
         var count = 0
-
-        // Subtítulos declarados
-        doc.select("track[kind=subtitles][src], track[src]").forEach { t ->
-            val src = t.absUrl("src")
-            if (src.startsWith("http")) {
-                subtitleCallback(SubtitleFile(url = src, lang = "es", headers = emptyMap()))
-            }
-        }
 
         val media = linkedSetOf<String>()
         doc.select("video[src], video source[src], audio[src], source[src]").forEach { el ->
