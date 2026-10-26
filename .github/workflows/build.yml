@@ -16,7 +16,12 @@ jobs:
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.14.4'
+          gradle-version: '8.14'
+      - name: Inject TMDB API key from secrets
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: |
+          sed -i "s/TMDB_API_KEY_PLACEHOLDER/${TMDB_API_KEY}/g"             DonghuaFlix/src/main/kotlin/com/donghuaflix/DonghuaFlixProvider.kt
       - name: Build plugin
         run: gradle DonghuaFlix:make makePluginsJson
       - name: Publish builds branch
