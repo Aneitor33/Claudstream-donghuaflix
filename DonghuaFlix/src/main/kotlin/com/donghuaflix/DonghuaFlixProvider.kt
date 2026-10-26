@@ -20,6 +20,9 @@ class DonghuaFlixProvider : MainAPI() {
     override val supportedTypes =
         setOf(TvType.Anime, TvType.AnimeMovie, TvType.AsianDrama, TvType.Movie, TvType.TvSeries)
 
+    // ── Datos ────────────────────────────────────────────────────────────
+    // La web desplegada no sirve /data (la SPA responde HTML): el proveedor
+    // lee los JSON del repositorio, con jsDelivr de espejo.
     private val dataBases = listOf(
         "https://raw.githubusercontent.com/Aneitor33/donghuaflix/main/public/data",
         "https://cdn.jsdelivr.net/gh/Aneitor33/donghuaflix@main/public/data",
@@ -46,6 +49,7 @@ class DonghuaFlixProvider : MainAPI() {
         val sourceBase: String?,
     )
 
+    /** Ficha (objeto series) + contenedor raíz (donde viven episodes/seasons). */
     private data class Detail(val series: JSONObject, val root: JSONObject)
 
     private val indexCache = ConcurrentHashMap<String, Index>()
@@ -55,6 +59,8 @@ class DonghuaFlixProvider : MainAPI() {
     private val maxShards = 80
     private val shardWave = 16
     private val detailCacheMax = 20
+
+    // ── Utilidades ───────────────────────────────────────────────────────
 
     private suspend fun getText(url: String): String? = try {
         app.get(url).text
@@ -108,6 +114,8 @@ class DonghuaFlixProvider : MainAPI() {
         }
         return null
     }
+
+    // ── Catálogos e índices ──────────────────────────────────────────────
 
     private fun parseMaster(text: String): List<Catalog> {
         val root = parseJson(text) as? JSONObject ?: return emptyList()
@@ -175,6 +183,8 @@ class DonghuaFlixProvider : MainAPI() {
         return result
     }
 
+    // ── Tipos y tarjetas ─────────────────────────────────────────────────
+
     private fun typeOf(e: Entry, idx: Index): TvType {
         val t = (e.type ?: "").lowercase()
         val c = idx.catalog.id
@@ -193,6 +203,8 @@ class DonghuaFlixProvider : MainAPI() {
         newMovieSearchResponse(e.title, "$mainUrl/dfx/${idx.catalog.id}/${e.slug}", typeOf(e, idx)) {
             posterUrl = e.poster
         }
+
+    // ── Home ─────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
         "donghualife" to "Donghua Life",
@@ -216,6 +228,8 @@ class DonghuaFlixProvider : MainAPI() {
             hasNext = from + pageSize < idx.entries.size,
         )
     }
+
+    // ── Búsqueda (híbrida) ───────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = fold(query.trim())
@@ -261,6 +275,8 @@ class DonghuaFlixProvider : MainAPI() {
         return out.values.toList()
     }
 
+    // ── Ficha (detalle) ──────────────────────────────────────────────────
+
     override suspend fun load(url: String): LoadResponse? {
         val marker = "/dfx/"
         if (!url.contains(marker)) return loadFromSource(url)
@@ -290,6 +306,8 @@ class DonghuaFlixProvider : MainAPI() {
     }
 
     private suspend fun scanDetail(idx: Index, slug: String): Detail? = coroutineScope {
+        // 1) Detalle individual: algunos catálogos publican <slug>.json cuya
+        //    raíz es {series: {...}, seasons: [...], episodes: [...]}
         if ('/' !in slug) {
             getData("${idx.detailsBase}/$slug.json")?.let { text ->
                 (parseJson(text) as? JSONObject)?.let { root ->
@@ -297,6 +315,9 @@ class DonghuaFlixProvider : MainAPI() {
                 }
             }
         }
+        // 2) Shards: la raíz de cada shard es
+        //    {series: [...], seasons: [...], episodes: [...]}
+        //    y los episodios/seasons se filtran por seriesId == slug.
         var result: Detail? = null
         var n = 0
         while (n < maxShards && result == null) {
@@ -389,6 +410,7 @@ class DonghuaFlixProvider : MainAPI() {
         }
     }
 
+    /** Recoge las URL de un array "servers"/"sources" ({name,url}). */
     private fun serverUrlsIn(arr: JSONArray?): List<String> {
         if (arr == null) return emptyList()
         val out = LinkedHashSet<String>()
@@ -420,6 +442,8 @@ class DonghuaFlixProvider : MainAPI() {
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             if (shardMode) {
+                // En los shards los episodios se filtran por serie:
+                // asi se evitan episodios "mezclados" de otras fichas.
                 val epSeries = o.optString("seriesId")
                 if (epSeries != slug && epSeries != seriesId) continue
             }
@@ -447,6 +471,8 @@ class DonghuaFlixProvider : MainAPI() {
         }
         return out.sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
     }
+
+    // ── Consulta de fuentes (híbrido) ────────────────────────────────────
 
     private suspend fun sourcePage(idx: Index, slug: String): String? {
         val base = idx.sourceBase ?: return null
@@ -499,6 +525,8 @@ class DonghuaFlixProvider : MainAPI() {
         }
     }
 
+    // ── Reproducción ─────────────────────────────────────────────────────
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -514,6 +542,7 @@ class DonghuaFlixProvider : MainAPI() {
         return emitted > 0
     }
 
+    /** Resuelve una URL (directa, embed o página) hasta conseguir enlaces. */
     private suspend fun resolve(
         u: String,
         depth: Int,
@@ -528,8 +557,10 @@ class DonghuaFlixProvider : MainAPI() {
         if (depth > 2) return 0
         var emitted = 0
         when {
+            isDownloadPath(url) -> emitted += extractDownloadPage(url, callback)
             "dailymotion.com" in url -> emitted += extractDailymotion(url, callback)
             "ok.ru" in url -> emitted += extractOkRu(url, callback)
+            "vidhide" in url || "earn.vids" in url -> emitted += extractVidhide(url, callback)
             else -> {
                 runCatching {
                     loadExtractor(url, null, subtitleCallback) { link ->
@@ -561,11 +592,14 @@ class DonghuaFlixProvider : MainAPI() {
     private fun isYoutubeUrl(u: String): Boolean =
         u.contains("youtube.com/embed/") || u.contains("youtu.be/")
 
+    /** Hosts con extractor disponible en CloudStream o en este proveedor. */
     private val knownHostPatterns = listOf(
         "voe.sx", "streamtape", "mixdrop", "dood.", "doodstream", "filemoon",
         "streamwish", "supervideo", "vidmoly", "upstream.to", "mp4upload",
         "filelions", "luluvdo", "dailymotion", "ok.ru", "youtube", "youtu.be",
         "vimeo", "googlevideo", "sblongvu", "playlist.php", "player.php", "play.php",
+        "vidhide", "earn.vids", "pelispedia", "streamhg",
+        "ashleyhardat", "audinifer", "morencius", "voe.sx",
     )
 
     private fun isKnownHost(u: String): Boolean =
@@ -632,6 +666,78 @@ class DonghuaFlixProvider : MainAPI() {
         }
         return count
     }
+
+    /**
+     * Raspado genérico de páginas de reproductor: medios directos, iframes,
+     * enlaces a hosts conocidos (VOE, Streamtape, Mixdrop…) y URLs sueltas
+     * en el HTML/JS. Los candidatos se resuelven recursivamente (límite de
+     * profundidad) pasando por los extractores registrados de CloudStream.
+     */
+    /** Páginas de descarga de Streamwish/Earnvids/VidHide: el mp4 directo
+     *  sale de un formulario con token (op=download1). */
+    private suspend fun extractDownloadPage(u: String, callback: (ExtractorLink) -> Unit): Int {
+        val page = getText(u) ?: return 0
+        var count = grepMedia(page, u, callback)
+        if (count > 0) return count
+
+        val op = Regex("""name=["']op["'][^>]*value=["']([^"']+)""").find(page)?.groupValues?.get(1)
+            ?: "download1"
+        val token = Regex("""name=["']token["'][^>]*value=["']([^"']+)""").find(page)?.groupValues?.get(1)
+        if (token == null) return 0
+
+        return try {
+            val html = app.post(u, data = mapOf("op" to op, "token" to token)).text
+            var n = grepMedia(html, u, callback)
+            Regex("""id=["']download_link["'][^>]*href=["']([^"']+)""").find(html)?.let { m ->
+                val link = m.groupValues[1].replace("&amp;", "&")
+                if (link.startsWith("http")) {
+                    emit(link, u, callback)
+                    n++
+                }
+            }
+            n
+        } catch (_: Exception) {
+            0
+        }
+    }
+
+    /** Busca m3u8/mp4 embebidos en un HTML (players tipo player.js). */
+    private fun grepMedia(page: String, referer: String, callback: (ExtractorLink) -> Unit): Int {
+        val found = LinkedHashSet<String>()
+        listOf(
+            Regex(
+                """["']((?:https?:)?//[^"'<>\s]+?\.(?:m3u8|mp4)(?:\?[^"'<>\s]*)?)["']""",
+                RegexOption.IGNORE_CASE
+            ),
+            Regex(
+                """file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""",
+                RegexOption.IGNORE_CASE
+            ),
+        ).forEach { rx ->
+            rx.findAll(page).forEach { m ->
+                val raw = m.groupValues[1].replace("&amp;", "&").replace("\\/", "/")
+                when {
+                    raw.startsWith("http") -> found.add(raw)
+                    raw.startsWith("//") -> found.add("https:$raw")
+                }
+            }
+        }
+        var count = 0
+        found.forEach { link ->
+            emit(link, referer, callback)
+            count++
+        }
+        return count
+    }
+
+    /** VidHide/earn.vids: el manifiesto HLS va embebido en la pagina del player. */
+    private suspend fun extractVidhide(u: String, callback: (ExtractorLink) -> Unit): Int {
+        val page = getText(u) ?: return 0
+        return grepMedia(page, u, callback)
+    }
+
+    private fun isDownloadPath(u: String): Boolean =
+        u.contains("/d/", true) || u.contains("/download/", true)
 
     private suspend fun scrape(
         pageUrl: String,
