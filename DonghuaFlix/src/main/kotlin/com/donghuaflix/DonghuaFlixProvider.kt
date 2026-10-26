@@ -13,6 +13,8 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.URLEncoder
 import java.security.MessageDigest
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import java.text.Normalizer
 import java.util.concurrent.ConcurrentHashMap
 
@@ -851,9 +853,10 @@ class DonghuaFlixProvider : MainAPI() {
     private fun isDownloadPath(u: String): Boolean =
         u.contains("/d/", true) || u.contains("/download/", true)
 
-    /** Barrera ALTCHA (proof-of-work) de los players tipo VidHide:
-     *  pide el reto, calcula el numero por fuerza bruta (SHA-256) y envia
-     *  el formulario de acceso. Devuelve el HTML real del player. */
+    /** Barrera ALTCHA v2 (proof-of-work) de los players tipo VidHide.
+     *  Algoritmo (segun altcha.min.js): password = nonce || contadorBE32,
+     *  salt = salt del reto; se itera PBKDF2-HMAC-SHA256 (cost iteraciones)
+     *  hasta que la clave derivada empiece por keyPrefix. */
     private suspend fun bypassAltchaGate(pageUrl: String, html: String): String? {
         val doc = Jsoup.parse(html, pageUrl)
         val widget = doc.selectFirst("altcha-widget") ?: return null
@@ -865,41 +868,77 @@ class DonghuaFlixProvider : MainAPI() {
 
         val chText = getText(challengeUrl) ?: return null
         val ch = parseJson(chText) as? JSONObject ?: return null
-        val salt = ch.optString("salt")
-        val target = ch.optString("challenge")
-        val max = ch.optInt("maxnumber", 0)
-        if (salt.isBlank() || target.isBlank() || max <= 0) return null
+        val params = ch.optJSONObject("parameters") ?: return null
+        val algorithm = params.optString("algorithm")
+        val cost = params.optInt("cost", 10000).coerceAtLeast(1)
+        val keyLength = params.optInt("keyLength", 32).coerceAtLeast(1)
+        val keyPrefix = params.optString("keyPrefix", "0")
+        val nonce = hexToBytes(params.optString("nonce")) ?: return null
+        val salt = hexToBytes(params.optString("salt")) ?: return null
+        val prefixBytes = if (keyPrefix.length % 2 == 0) hexToBytes(keyPrefix) else null
 
-        // Fuerza bruta: sha256hex(salt + n) == challenge
-        val number = withContext(Dispatchers.Default) {
-            val digest = MessageDigest.getInstance("SHA-256")
-            val saltBytes = salt.toByteArray()
-            var found = -1
-            var n = 0
-            while (n <= max && found < 0) {
-                digest.update(saltBytes)
-                val h = digest.digest(n.toString().toByteArray())
-                    .joinToString("") { "%02x".format(it) }
-                if (h == target) found = n
-                n++
-            }
-            found
+        val start = System.currentTimeMillis()
+        val workers = 4
+        val counter = withContext(Dispatchers.Default) {
+            (0 until workers).map { w ->
+                async {
+                    val password = ByteArray(nonce.size + 4)
+                    System.arraycopy(nonce, 0, password, 0, nonce.size)
+                    var c = w
+                    while (c < 4_000_000) {
+                        password[nonce.size] = (c ushr 24).toByte()
+                        password[nonce.size + 1] = (c ushr 16).toByte()
+                        password[nonce.size + 2] = (c ushr 8).toByte()
+                        password[nonce.size + 3] = c.toByte()
+                        val dk = if (algorithm.startsWith("PBKDF2")) {
+                            pbkdf2HmacSha256(password, salt, cost, keyLength)
+                        } else {
+                            iterativeDigest(algorithm, password, salt, cost, keyLength)
+                        }
+                        val ok = if (prefixBytes != null) {
+                            prefixBytes.indices.all { dk[it] == prefixBytes[it] }
+                        } else {
+                            dk.joinToString("") { "%02x".format(it) }.startsWith(keyPrefix)
+                        }
+                        if (ok) return@async c
+                        c += workers
+                    }
+                    -1
+                }
+            }.awaitAll().firstOrNull { it >= 0 }
         }
-        if (number < 0) return null
+        if (counter == null) return null
+        val took = System.currentTimeMillis() - start
+
+        // derivedKey final (para el payload)
+        val finalPassword = ByteArray(nonce.size + 4)
+        System.arraycopy(nonce, 0, finalPassword, 0, nonce.size)
+        finalPassword[nonce.size] = (counter ushr 24).toByte()
+        finalPassword[nonce.size + 1] = (counter ushr 16).toByte()
+        finalPassword[nonce.size + 2] = (counter ushr 8).toByte()
+        finalPassword[nonce.size + 3] = counter.toByte()
+        val dkFinal = if (algorithm.startsWith("PBKDF2")) {
+            pbkdf2HmacSha256(finalPassword, salt, cost, keyLength)
+        } else {
+            iterativeDigest(algorithm, finalPassword, salt, cost, keyLength)
+        }
+        val derivedHex = dkFinal.joinToString("") { "%02x".format(it) }
 
         val payload = Base64.encodeToString(
             JSONObject()
-                .put("algorithm", ch.optString("algorithm", "SHA-256"))
-                .put("challenge", target)
-                .put("number", number)
-                .put("salt", salt)
+                .put("algorithm", algorithm)
+                .put("challenge", params)
+                .put("counter", counter)
+                .put("derivedKey", derivedHex)
+                .put("expiresAt", params.optLong("expiresAt", 0))
+                .put("nonce", params.optString("nonce"))
+                .put("salt", params.optString("salt"))
                 .put("signature", ch.optString("signature"))
-                .put("took", 0)
+                .put("took", took)
                 .toString().toByteArray(),
             Base64.NO_WRAP
         )
 
-        // El widget suele enviar el payload como "altcha"; algunos lo usan como "access"
         for (field in listOf("altcha", "access")) {
             val resp = try {
                 app.post(action, data = mapOf(
@@ -913,6 +952,44 @@ class DonghuaFlixProvider : MainAPI() {
             if (resp.isNotBlank() && !resp.contains("altcha-widget")) return resp
         }
         return null
+    }
+
+    private fun hexToBytes(hex: String): ByteArray? {
+        if (hex.isBlank() || hex.length % 2 != 0) return null
+        return try {
+            ByteArray(hex.length / 2) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** PBKDF2-HMAC-SHA256 (un bloque de 32 bytes basta para el prefijo). */
+    private fun pbkdf2HmacSha256(password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(password, "HmacSHA256"))
+        var u = mac.doFinal(salt + byteArrayOf(0, 0, 0, 1))
+        val out = u.copyOf(dkLen.coerceAtMost(u.size))
+        var i = 1
+        while (i < iterations) {
+            u = mac.doFinal(u)
+            for (b in out.indices) out[b] = (out[b].toInt() xor u[b].toInt()).toByte()
+            i++
+        }
+        return out
+    }
+
+    /** Algoritmo "SHA-256/384/512" del worker: iterar digest sobre salt||password. */
+    private fun iterativeDigest(algorithm: String, password: ByteArray, salt: ByteArray, cost: Int, keyLen: Int): ByteArray {
+        val md = MessageDigest.getInstance(algorithm)
+        var data = salt + password
+        var dk = ByteArray(0)
+        var i = 0
+        while (i < cost) {
+            dk = md.digest(data).copyOf(keyLen)
+            data = dk
+            i++
+        }
+        return dk
     }
 
     private suspend fun scrape(
