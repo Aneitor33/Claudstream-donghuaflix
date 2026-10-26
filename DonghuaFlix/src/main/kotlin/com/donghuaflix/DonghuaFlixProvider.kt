@@ -4,11 +4,15 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import android.util.Base64
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.text.Normalizer
 import java.util.concurrent.ConcurrentHashMap
 
@@ -847,6 +851,70 @@ class DonghuaFlixProvider : MainAPI() {
     private fun isDownloadPath(u: String): Boolean =
         u.contains("/d/", true) || u.contains("/download/", true)
 
+    /** Barrera ALTCHA (proof-of-work) de los players tipo VidHide:
+     *  pide el reto, calcula el numero por fuerza bruta (SHA-256) y envia
+     *  el formulario de acceso. Devuelve el HTML real del player. */
+    private suspend fun bypassAltchaGate(pageUrl: String, html: String): String? {
+        val doc = Jsoup.parse(html, pageUrl)
+        val widget = doc.selectFirst("altcha-widget") ?: return null
+        val form = doc.selectFirst("form.access-form") ?: return null
+        val action = form.absUrl("action").ifBlank { pageUrl }
+        val csrf = form.selectFirst("input[name=_token]")?.attr("value") ?: return null
+        val challengeUrl = widget.attr("challenge")
+        if (challengeUrl.isBlank()) return null
+
+        val chText = getText(challengeUrl) ?: return null
+        val ch = parseJson(chText) as? JSONObject ?: return null
+        val salt = ch.optString("salt")
+        val target = ch.optString("challenge")
+        val max = ch.optInt("maxnumber", 0)
+        if (salt.isBlank() || target.isBlank() || max <= 0) return null
+
+        // Fuerza bruta: sha256hex(salt + n) == challenge
+        val number = withContext(Dispatchers.Default) {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val saltBytes = salt.toByteArray()
+            var found = -1
+            var n = 0
+            while (n <= max && found < 0) {
+                digest.update(saltBytes)
+                val h = digest.digest(n.toString().toByteArray())
+                    .joinToString("") { "%02x".format(it) }
+                if (h == target) found = n
+                n++
+            }
+            found
+        }
+        if (number < 0) return null
+
+        val payload = Base64.encodeToString(
+            JSONObject()
+                .put("algorithm", ch.optString("algorithm", "SHA-256"))
+                .put("challenge", target)
+                .put("number", number)
+                .put("salt", salt)
+                .put("signature", ch.optString("signature"))
+                .put("took", 0)
+                .toString().toByteArray(),
+            Base64.NO_WRAP
+        )
+
+        // El widget suele enviar el payload como "altcha"; algunos lo usan como "access"
+        for (field in listOf("altcha", "access")) {
+            val resp = try {
+                app.post(action, data = mapOf(
+                    "_token" to csrf,
+                    "access" to (if (field == "access") payload else "0"),
+                    field to (if (field == "altcha") payload else "0"),
+                )).text
+            } catch (_: Exception) {
+                continue
+            }
+            if (resp.isNotBlank() && !resp.contains("altcha-widget")) return resp
+        }
+        return null
+    }
+
     private suspend fun scrape(
         pageUrl: String,
         depth: Int,
@@ -862,6 +930,14 @@ class DonghuaFlixProvider : MainAPI() {
         var count = 0
         val media = linkedSetOf<String>()
         val candidates = linkedSetOf<String>()
+
+        // Barrera anti-bots ALTCHA (proof-of-work): resolver y usar el HTML real
+        val rawHtml = doc.html()
+        if (rawHtml.contains("altcha-widget")) {
+            bypassAltchaGate(pageUrl, rawHtml)?.let { realHtml ->
+                count += grepMedia(realHtml, pageUrl, callback)
+            }
+        }
 
         doc.select("video[src], video source[src], audio[src], source[src]").forEach { el ->
             el.absUrl("src").takeIf { isDirectMedia(it) }?.let(media::add)
