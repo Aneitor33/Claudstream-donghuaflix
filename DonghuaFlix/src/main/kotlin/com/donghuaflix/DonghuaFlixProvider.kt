@@ -3,6 +3,7 @@ package com.donghuaflix
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
