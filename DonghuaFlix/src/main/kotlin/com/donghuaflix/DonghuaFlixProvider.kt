@@ -46,7 +46,6 @@ class DonghuaFlixProvider : MainAPI() {
         val sourceBase: String?,
     )
 
-    /** Ficha (objeto series) + contenedor raíz (donde viven episodes/seasons). */
     private data class Detail(val series: JSONObject, val root: JSONObject)
 
     private val indexCache = ConcurrentHashMap<String, Index>()
@@ -355,13 +354,13 @@ class DonghuaFlixProvider : MainAPI() {
         val rawPoster = firstText(d, "image", "poster", "p", "img", "cover")
         val poster = if (rawPoster.isBlank()) entry.poster ?: ""
         else absolutize(rawPoster, idx.imageBase)
-        val plot = firstText(d, "synopsis", "description", "plot", "desc", "overview")
+        val plot = firstText(d, "synopsis", "sipnosis", "description", "plot", "desc", "overview")
         val year = firstIntOrNull(d, "year", "y")
         val genres = (d.optJSONArray("genres") ?: d.optJSONArray("g"))?.let { arr ->
             (0 until arr.length()).mapNotNull { arr.optString(it).ifBlank { null } }
         }.orEmpty()
         val type = typeOf(entry.copy(type = d.optString("type").ifBlank { null } ?: entry.type), idx)
-        val episodes = episodesIn(root, entry.slug)
+        val episodes = episodesIn(root, entry.slug, d.optString("id").ifBlank { entry.slug })
 
         return if (episodes.isNotEmpty() && type != TvType.Movie) {
             newTvSeriesLoadResponse(title, url, type, episodes) {
@@ -401,13 +400,16 @@ class DonghuaFlixProvider : MainAPI() {
         return out.toList()
     }
 
-    private fun episodesIn(root: JSONObject, slug: String): List<Episode> {
+    private fun episodesIn(root: JSONObject, slug: String, seriesId: String): List<Episode> {
+        val shardMode = root.optJSONArray("series") != null
         val seasons = HashMap<String, Int>()
         root.optJSONArray("seasons")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val sSeries = o.optString("seriesId")
-                if (sSeries.isNotBlank() && sSeries != slug) continue
+                if (shardMode) {
+                    val sSeries = o.optString("seriesId")
+                    if (sSeries != slug && sSeries != seriesId) continue
+                }
                 seasons[o.optString("id")] = o.optInt("number", 1)
             }
         }
@@ -417,8 +419,10 @@ class DonghuaFlixProvider : MainAPI() {
         val out = ArrayList<Episode>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val epSeries = o.optString("seriesId")
-            if (epSeries.isNotBlank() && epSeries != slug) continue
+            if (shardMode) {
+                val epSeries = o.optString("seriesId")
+                if (epSeries != slug && epSeries != seriesId) continue
+            }
             val urls = LinkedHashSet<String>()
             firstText(o, "url", "u", "link", "href", "src", "file")
                 .ifBlank { null }?.let(urls::add)
@@ -427,8 +431,12 @@ class DonghuaFlixProvider : MainAPI() {
             if (urls.isEmpty()) continue
             val num = firstIntOrNull(o, "number", "n", "num", "episode", "ep") ?: (i + 1)
             val rawName = firstText(o, "title", "t", "name", "label")
-            val name = if (rawName.isBlank()) "Episodio $num"
-            else rawName.replace(" online Sub Español", "", ignoreCase = true)
+            var name = rawName
+                .replace(Regex("""\s*online\s*sub espa[ñn]ol.*$""", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("""\s*sub espa[ñn]ol.*$""", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("""\s+(completo|online|hd).*$""", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (name.isBlank() || name.length > 60) name = "Episodio $num"
             val season = o.optString("seasonId").ifBlank { null }?.let(seasons::get)
             out.add(newEpisode(urls.joinToString("\n")) {
                 this.name = name
@@ -501,28 +509,38 @@ class DonghuaFlixProvider : MainAPI() {
         val urls = data.lines().map { it.trim() }.filter { it.startsWith("http") }.distinct()
         if (urls.isEmpty()) return false
         for (raw in urls) {
-            val u = normalizeYoutube(raw)
-            when {
-                isDirectMedia(u) -> {
-                    emit(u, u, callback)
-                    emitted++
-                }
-
-                "dailymotion.com" in u -> emitted += extractDailymotion(u, callback)
-                "ok.ru" in u -> emitted += extractOkRu(u, callback)
-
-                else -> {
-                    runCatching {
-                        loadExtractor(u, null, subtitleCallback) { link ->
-                            emitted++
-                            callback(link)
-                        }
-                    }
-                    emitted += scrape(u, 0, subtitleCallback, callback)
-                }
-            }
+            emitted += resolve(raw, 0, subtitleCallback, callback)
         }
         return emitted > 0
+    }
+
+    private suspend fun resolve(
+        u: String,
+        depth: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Int {
+        val url = normalizeYoutube(u)
+        if (isDirectMedia(url)) {
+            emit(url, url, callback)
+            return 1
+        }
+        if (depth > 2) return 0
+        var emitted = 0
+        when {
+            "dailymotion.com" in url -> emitted += extractDailymotion(url, callback)
+            "ok.ru" in url -> emitted += extractOkRu(url, callback)
+            else -> {
+                runCatching {
+                    loadExtractor(url, null, subtitleCallback) { link ->
+                        emitted++
+                        callback(link)
+                    }
+                }
+                emitted += scrape(url, depth, subtitleCallback, callback)
+            }
+        }
+        return emitted
     }
 
     private fun normalizeYoutube(u: String): String = when {
@@ -539,6 +557,19 @@ class DonghuaFlixProvider : MainAPI() {
 
     private fun isDirectMedia(u: String): Boolean =
         u.contains(".m3u8", true) || u.contains(".mp4", true) || u.contains(".mpd", true)
+
+    private fun isYoutubeUrl(u: String): Boolean =
+        u.contains("youtube.com/embed/") || u.contains("youtu.be/")
+
+    private val knownHostPatterns = listOf(
+        "voe.sx", "streamtape", "mixdrop", "dood.", "doodstream", "filemoon",
+        "streamwish", "supervideo", "vidmoly", "upstream.to", "mp4upload",
+        "filelions", "luluvdo", "dailymotion", "ok.ru", "youtube", "youtu.be",
+        "vimeo", "googlevideo", "sblongvu", "playlist.php", "player.php", "play.php",
+    )
+
+    private fun isKnownHost(u: String): Boolean =
+        knownHostPatterns.any { it in u }
 
     private suspend fun extractDailymotion(u: String, callback: (ExtractorLink) -> Unit): Int {
         val id = Regex("""[?&]video=([\w-]+)""").find(u)?.groupValues?.get(1)
@@ -608,49 +639,40 @@ class DonghuaFlixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Int {
-        if (depth > 1) return 0
+        if (depth > 2) return 0
         val doc = try {
             app.get(pageUrl).document
         } catch (_: Exception) {
             return 0
         }
         var count = 0
-
         val media = linkedSetOf<String>()
+        val candidates = linkedSetOf<String>()
+
         doc.select("video[src], video source[src], audio[src], source[src]").forEach { el ->
             el.absUrl("src").takeIf { isDirectMedia(it) }?.let(media::add)
         }
 
-        doc.select("iframe[src]").forEach { iframe ->
-            val src = iframe.absUrl("src")
+        doc.select("iframe[src], a[href]").forEach { el ->
+            val link = el.absUrl(if (el.hasAttr("src")) "src" else "href")
+            if (!link.startsWith("http")) return@forEach
             when {
-                src.contains("youtube.com/embed/") || src.contains("youtu.be/") ->
-                    src.substringAfterLast("/").substringBefore('?').substringBefore('&')
-                        .takeIf { it.isNotBlank() }
-                        ?.let { media.add("https://www.youtube.com/watch?v=$it") }
-
-                isDirectMedia(src) -> media.add(src)
-
-                depth == 0 && (src.contains("player", true) || src.contains("embed", true)) ->
-                    count += scrape(src, depth + 1, subtitleCallback, callback)
+                isDirectMedia(link) -> media.add(link)
+                isYoutubeUrl(link) -> media.add(normalizeYoutube(link))
+                depth < 2 && (isKnownHost(link) || isPlayerPath(link)) -> candidates.add(link)
             }
         }
 
         val html = doc.html()
-        listOf(
-            Regex(
-                """["']((?:https?:)?//[^"'<>\s]+?\.(?:m3u8|mp4|mpd))(?:[?][^"'<>\s]*)?["']""",
-                RegexOption.IGNORE_CASE
-            ),
-            Regex(
-                """file\s*:\s*["']([^"']+\.(?:m3u8|mp4|mpd)[^"']*)["']""",
-                RegexOption.IGNORE_CASE
-            ),
-        ).forEach { rx ->
-            rx.findAll(html).forEach { m ->
-                val u = m.groupValues[1].replace("&amp;", "&")
-                val abs = if (u.startsWith("//")) "https:$u" else u
-                if (abs.startsWith("http")) media.add(abs)
+        Regex("""https?://[^\s"'<>\\]+""").findAll(html).forEach { m ->
+            val link = m.value
+                .replace("\\/", "/")
+                .trimEnd('"', '\'', ')', ']', '}', ';')
+            if (!link.startsWith("http")) return@forEach
+            when {
+                isDirectMedia(link) -> media.add(link)
+                isYoutubeUrl(link) -> media.add(normalizeYoutube(link))
+                depth < 2 && isKnownHost(link) -> candidates.add(link)
             }
         }
 
@@ -658,8 +680,15 @@ class DonghuaFlixProvider : MainAPI() {
             emit(u, pageUrl, callback)
             count++
         }
+        candidates.forEach { link ->
+            count += resolve(link, depth + 1, subtitleCallback, callback)
+        }
         return count
     }
+
+    private fun isPlayerPath(u: String): Boolean =
+        u.contains("/embed/", true) || u.contains("/e/", true) ||
+                u.contains("player", true) || u.contains("/video/", true)
 
     private suspend fun emit(
         u: String,
