@@ -3,7 +3,6 @@ package com.donghuaflix
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,10 +20,6 @@ class DonghuaFlixProvider : MainAPI() {
     override val supportedTypes =
         setOf(TvType.Anime, TvType.AnimeMovie, TvType.AsianDrama, TvType.Movie, TvType.TvSeries)
 
-    // ── Datos ────────────────────────────────────────────────────────────
-    // La web desplegada no sirve /data (la SPA responde HTML), así que el
-    // proveedor lee los JSON directamente del repositorio, con jsDelivr de
-    // espejo y la propia web como tercera opción futura.
     private val dataBases = listOf(
         "https://raw.githubusercontent.com/Aneitor33/donghuaflix/main/public/data",
         "https://cdn.jsdelivr.net/gh/Aneitor33/donghuaflix@main/public/data",
@@ -51,16 +46,16 @@ class DonghuaFlixProvider : MainAPI() {
         val sourceBase: String?,
     )
 
+    /** Ficha (objeto series) + contenedor raíz (donde viven episodes/seasons). */
+    private data class Detail(val series: JSONObject, val root: JSONObject)
+
     private val indexCache = ConcurrentHashMap<String, Index>()
-    private val shardCache = ConcurrentHashMap<String, ConcurrentHashMap<Int, Any>>()
-    private val shardMiss = ConcurrentHashMap<String, ConcurrentHashMap<Int, Boolean>>()
+    private val detailCache = ConcurrentHashMap<String, Detail>()
 
     private val pageSize = 30
-    private val maxShards = 120
-    private val shardBatch = 4
-    private val maxCachedShards = 40
-
-    // ── Utilidades ───────────────────────────────────────────────────────
+    private val maxShards = 80
+    private val shardWave = 16
+    private val detailCacheMax = 20
 
     private suspend fun getText(url: String): String? = try {
         app.get(url).text
@@ -74,7 +69,6 @@ class DonghuaFlixProvider : MainAPI() {
         null
     }
 
-    /** Contenido de `path` relativo a /data, probando bases en orden. */
     private suspend fun getData(path: String): String? {
         activeBase?.let { base ->
             getText("$base/$path")?.let { return it }
@@ -115,8 +109,6 @@ class DonghuaFlixProvider : MainAPI() {
         }
         return null
     }
-
-    // ── Catálogos e índices ──────────────────────────────────────────────
 
     private fun parseMaster(text: String): List<Catalog> {
         val root = parseJson(text) as? JSONObject ?: return emptyList()
@@ -168,7 +160,7 @@ class DonghuaFlixProvider : MainAPI() {
 
     private suspend fun catalogs(): List<Index> {
         val masterText = getData("catalog-index.json")
-            ?: return indexCache.values.toList() // resiliencia: usar caché si no hay red
+            ?: return indexCache.values.toList()
         val result = ArrayList<Index>()
         for (cat in parseMaster(masterText)) {
             val cached = indexCache[cat.id]
@@ -183,8 +175,6 @@ class DonghuaFlixProvider : MainAPI() {
         }
         return result
     }
-
-    // ── Tipos y tarjetas ─────────────────────────────────────────────────
 
     private fun typeOf(e: Entry, idx: Index): TvType {
         val t = (e.type ?: "").lowercase()
@@ -205,8 +195,6 @@ class DonghuaFlixProvider : MainAPI() {
             posterUrl = e.poster
         }
 
-    // ── Home ─────────────────────────────────────────────────────────────
-
     override val mainPage = mainPageOf(
         "donghualife" to "Donghua Life",
         "donghuasub" to "DonghuaSub",
@@ -216,7 +204,6 @@ class DonghuaFlixProvider : MainAPI() {
         "pelispedia" to "PelisPedia",
     )
 
-    // Si la compilación falla por la firma, usa: request: MainPageRequest?
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val idx = catalogs().firstOrNull { it.catalog.id == request.data }
             ?: throw ErrorLoadingException("Catálogo no disponible: ${request.data}")
@@ -231,13 +218,10 @@ class DonghuaFlixProvider : MainAPI() {
         )
     }
 
-    // ── Búsqueda (híbrida) ───────────────────────────────────────────────
-
     override suspend fun search(query: String): List<SearchResponse> {
         val q = fold(query.trim())
         if (q.isBlank()) return emptyList()
         val all = catalogs()
-        // 1) Índices ligeros de DonghuaFlix
         val primary = all.flatMap { idx ->
             idx.entries.asSequence()
                 .filter { q in fold(it.title) || q in fold(it.slug) }
@@ -246,7 +230,6 @@ class DonghuaFlixProvider : MainAPI() {
                 .toList()
         }.distinctBy { it.url }
         if (primary.isNotEmpty()) return primary.take(60)
-        // 2) Red de seguridad: búsqueda HTML en las fuentes originales
         return sourceSearch(all, query)
     }
 
@@ -279,8 +262,6 @@ class DonghuaFlixProvider : MainAPI() {
         return out.values.toList()
     }
 
-    // ── Ficha (detalle) ──────────────────────────────────────────────────
-
     override suspend fun load(url: String): LoadResponse? {
         val marker = "/dfx/"
         if (!url.contains(marker)) return loadFromSource(url)
@@ -292,68 +273,50 @@ class DonghuaFlixProvider : MainAPI() {
         val idx = catalogs().firstOrNull { it.catalog.id == catId } ?: return null
         val entry = idx.entries.firstOrNull { it.slug == slug || it.id == slug } ?: return null
 
-        // 1) Detalle publicado en los shards del repositorio
         findDetail(idx, slug)?.let { return buildFromDetail(it, entry, idx, url) }
-
-        // 2) Híbrido: consultar la página de origen
         sourcePage(idx, slug)?.let { return loadFromSource(it) }
 
-        // 3) Tarjeta mínima con lo que sabemos del índice
         return newMovieLoadResponse(entry.title, url, typeOf(entry, idx), url) {
             posterUrl = entry.poster
         }
     }
 
-    private suspend fun findDetail(idx: Index, slug: String): JSONObject? = coroutineScope {
-        // Candidatos directos, por si algún catálogo publica un json por serie
-        if ('/' !in slug) {
-            getData("${idx.detailsBase}/$slug.json")?.let { text ->
-                (parseJson(text) as? JSONObject)?.let { return@coroutineScope it }
-            }
+    private suspend fun findDetail(idx: Index, slug: String): Detail? {
+        detailCache["${idx.catalog.id}/$slug"]?.let { return it }
+        val found = scanDetail(idx, slug)
+        if (found != null && detailCache.size < detailCacheMax) {
+            detailCache["${idx.catalog.id}/$slug"] = found
         }
-        val cache = shardCache.getOrPut(idx.catalog.id) { ConcurrentHashMap() }
-        val miss = shardMiss.getOrPut(idx.catalog.id) { ConcurrentHashMap() }
-        var found: JSONObject? = null
-        var missStreak = 0
-        var n = 0
-        while (n < maxShards && missStreak < 2 && found == null) {
-            val upper = minOf(n + shardBatch, maxShards)
-            val results = (n until upper).map { i ->
-                async { i to loadShard(idx, i, cache, miss) }
-            }.awaitAll()
-            if (results.all { it.second == null }) missStreak++ else missStreak = 0
-            for ((_, root) in results) {
-                root ?: continue
-                detailIn(root, slug)?.let {
-                    found = it
-                    break
-                }
-            }
-            n += shardBatch
-        }
-        found
+        return found
     }
 
-    private suspend fun loadShard(
-        idx: Index,
-        i: Int,
-        cache: ConcurrentHashMap<Int, Any>,
-        miss: ConcurrentHashMap<Int, Boolean>,
-    ): Any? {
-        cache[i]?.let { return it }
-        if (miss.containsKey(i)) return null
-        val text = getData("${idx.detailsBase}/shard-$i.json")
-        if (text == null) {
-            miss[i] = true
-            return null
+    private suspend fun scanDetail(idx: Index, slug: String): Detail? = coroutineScope {
+        if ('/' !in slug) {
+            getData("${idx.detailsBase}/$slug.json")?.let { text ->
+                (parseJson(text) as? JSONObject)?.let { root ->
+                    return@coroutineScope Detail(root.optJSONObject("series") ?: root, root)
+                }
+            }
         }
-        val root = parseJson(text)
-        if (root == null) {
-            miss[i] = true
-            return null
+        var result: Detail? = null
+        var n = 0
+        while (n < maxShards && result == null) {
+            val upper = minOf(n + shardWave, maxShards)
+            val deferreds = (n until upper).map {
+                async { getData("${idx.detailsBase}/shard-$it.json") }
+            }
+            for (d in deferreds) {
+                if (result != null) break
+                val text = d.await()
+                val root = text?.let { parseJson(it) as? JSONObject } ?: continue
+                detailIn(root, slug)?.let { series ->
+                    result = Detail(series, root)
+                }
+            }
+            deferreds.forEach { it.cancel() }
+            n = upper
         }
-        if (cache.size < maxCachedShards) cache[i] = root
-        return root
+        result
     }
 
     private val arrayKeys = listOf("series", "items", "entries", "data")
@@ -381,22 +344,24 @@ class DonghuaFlixProvider : MainAPI() {
     }
 
     private suspend fun buildFromDetail(
-        d: JSONObject,
+        detail: Detail,
         entry: Entry,
         idx: Index,
         url: String,
     ): LoadResponse {
+        val d = detail.series
+        val root = detail.root
         val title = firstText(d, "title", "t", "name").ifBlank { entry.title }
-        val rawPoster = firstText(d, "poster", "p", "image", "img", "cover")
+        val rawPoster = firstText(d, "image", "poster", "p", "img", "cover")
         val poster = if (rawPoster.isBlank()) entry.poster ?: ""
         else absolutize(rawPoster, idx.imageBase)
-        val plot = firstText(d, "description", "synopsis", "plot", "desc", "overview")
+        val plot = firstText(d, "synopsis", "description", "plot", "desc", "overview")
         val year = firstIntOrNull(d, "year", "y")
         val genres = (d.optJSONArray("genres") ?: d.optJSONArray("g"))?.let { arr ->
             (0 until arr.length()).mapNotNull { arr.optString(it).ifBlank { null } }
         }.orEmpty()
-        val type = typeOf(entry, idx)
-        val episodes = episodesIn(d)
+        val type = typeOf(entry.copy(type = d.optString("type").ifBlank { null } ?: entry.type), idx)
+        val episodes = episodesIn(root, entry.slug)
 
         return if (episodes.isNotEmpty() && type != TvType.Movie) {
             newTvSeriesLoadResponse(title, url, type, episodes) {
@@ -406,9 +371,13 @@ class DonghuaFlixProvider : MainAPI() {
                 this.tags = genres
             }
         } else {
-            val direct = firstText(d, "url", "u", "link", "video", "src")
+            val direct = firstText(root, "url", "u", "link", "video", "src")
+            val servers = LinkedHashSet<String>()
+            serverUrlsIn(root.optJSONArray("servers")).forEach(servers::add)
+            serverUrlsIn(d.optJSONArray("servers")).forEach(servers::add)
             val dataUrl = when {
                 direct.startsWith("http") -> direct
+                servers.isNotEmpty() -> servers.joinToString("\n")
                 episodes.isNotEmpty() -> episodes.first().data
                 else -> url
             }
@@ -421,27 +390,55 @@ class DonghuaFlixProvider : MainAPI() {
         }
     }
 
-    private fun episodesIn(d: JSONObject): List<Episode> {
-        val arr = d.optJSONArray("episodes") ?: d.optJSONArray("eps")
-            ?: d.optJSONArray("items") ?: d.optJSONArray("chapters")
+    private fun serverUrlsIn(arr: JSONArray?): List<String> {
+        if (arr == null) return emptyList()
+        val out = LinkedHashSet<String>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            firstText(o, "url", "u", "link", "src", "href", "file")
+                .ifBlank { null }?.let(out::add)
+        }
+        return out.toList()
+    }
+
+    private fun episodesIn(root: JSONObject, slug: String): List<Episode> {
+        val seasons = HashMap<String, Int>()
+        root.optJSONArray("seasons")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val sSeries = o.optString("seriesId")
+                if (sSeries.isNotBlank() && sSeries != slug) continue
+                seasons[o.optString("id")] = o.optInt("number", 1)
+            }
+        }
+        val arr = root.optJSONArray("episodes") ?: root.optJSONArray("eps")
+            ?: root.optJSONArray("items") ?: root.optJSONArray("chapters")
             ?: return emptyList()
         val out = ArrayList<Episode>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val data = firstText(o, "url", "u", "link", "href", "src", "file")
-            if (data.isBlank()) continue
+            val epSeries = o.optString("seriesId")
+            if (epSeries.isNotBlank() && epSeries != slug) continue
+            val urls = LinkedHashSet<String>()
+            firstText(o, "url", "u", "link", "href", "src", "file")
+                .ifBlank { null }?.let(urls::add)
+            serverUrlsIn(o.optJSONArray("servers")).forEach(urls::add)
+            serverUrlsIn(o.optJSONArray("sources")).forEach(urls::add)
+            if (urls.isEmpty()) continue
             val num = firstIntOrNull(o, "number", "n", "num", "episode", "ep") ?: (i + 1)
-            val name = firstText(o, "title", "t", "name", "label").ifBlank { "Episodio $num" }
-            out.add(newEpisode(data) {
+            val rawName = firstText(o, "title", "t", "name", "label")
+            val name = if (rawName.isBlank()) "Episodio $num"
+            else rawName.replace(" online Sub Español", "", ignoreCase = true)
+            val season = o.optString("seasonId").ifBlank { null }?.let(seasons::get)
+            out.add(newEpisode(urls.joinToString("\n")) {
                 this.name = name
                 this.episode = num
+                if (season != null) this.season = season
             })
             if (out.size >= 600) break
         }
-        return out.sortedBy { it.episode }
+        return out.sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
     }
-
-    // ── Consulta de fuentes (híbrido) ────────────────────────────────────
 
     private suspend fun sourcePage(idx: Index, slug: String): String? {
         val base = idx.sourceBase ?: return null
@@ -494,38 +491,116 @@ class DonghuaFlixProvider : MainAPI() {
         }
     }
 
-    // ── Reproducción ─────────────────────────────────────────────────────
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        if (!data.startsWith("http")) return false
         var emitted = 0
+        val urls = data.lines().map { it.trim() }.filter { it.startsWith("http") }.distinct()
+        if (urls.isEmpty()) return false
+        for (raw in urls) {
+            val u = normalizeYoutube(raw)
+            when {
+                isDirectMedia(u) -> {
+                    emit(u, u, callback)
+                    emitted++
+                }
 
-        // Medio directo: emitir sin descargar nada
-        if (isDirectMedia(data)) {
-            emit(data, data, callback)
-            return true
-        }
+                "dailymotion.com" in u -> emitted += extractDailymotion(u, callback)
+                "ok.ru" in u -> emitted += extractOkRu(u, callback)
 
-        // 1) Extractores registrados de CloudStream (YouTube, etc.)
-        runCatching {
-            loadExtractor(data, null, subtitleCallback) { link ->
-                emitted++
-                callback(link)
+                else -> {
+                    runCatching {
+                        loadExtractor(u, null, subtitleCallback) { link ->
+                            emitted++
+                            callback(link)
+                        }
+                    }
+                    emitted += scrape(u, 0, subtitleCallback, callback)
+                }
             }
         }
-
-        // 2) Raspado del reproductor embebido
-        emitted += scrape(data, 0, subtitleCallback, callback)
         return emitted > 0
+    }
+
+    private fun normalizeYoutube(u: String): String = when {
+        u.contains("youtube.com/embed/") ->
+            "https://www.youtube.com/watch?v=" +
+                    u.substringAfterLast("/").substringBefore('?').substringBefore('&')
+
+        u.contains("youtu.be/") && !u.contains("watch?") ->
+            "https://www.youtube.com/watch?v=" +
+                    u.substringAfterLast("/").substringBefore('?').substringBefore('&')
+
+        else -> u
     }
 
     private fun isDirectMedia(u: String): Boolean =
         u.contains(".m3u8", true) || u.contains(".mp4", true) || u.contains(".mpd", true)
+
+    private suspend fun extractDailymotion(u: String, callback: (ExtractorLink) -> Unit): Int {
+        val id = Regex("""[?&]video=([\w-]+)""").find(u)?.groupValues?.get(1)
+            ?: u.removeSuffix("/").substringAfterLast("/")
+        val meta = getText("https://www.dailymotion.com/player/metadata/video/$id") ?: return 0
+        val qualities = (parseJson(meta) as? JSONObject)?.optJSONObject("qualities") ?: return 0
+        var count = 0
+        val keys = qualities.keys()
+        while (keys.hasNext()) {
+            val label = keys.next()
+            val list = qualities.optJSONArray(label) ?: continue
+            for (i in 0 until list.length()) {
+                val o = list.optJSONObject(i) ?: continue
+                val url = o.optString("url")
+                if (!url.startsWith("http")) continue
+                if (!url.contains(".m3u8", true) && !url.contains(".mp4", true)) continue
+                emit(url, "https://www.dailymotion.com", callback, label.toIntOrNull())
+                count++
+            }
+        }
+        return count
+    }
+
+    private suspend fun extractOkRu(u: String, callback: (ExtractorLink) -> Unit): Int {
+        val id = u.removeSuffix("/").substringAfterLast("/")
+        val page = getText("https://ok.ru/videoembed/$id") ?: return 0
+        var count = 0
+
+        Regex("""data-options="([^"]+)"""").find(page)?.let { m ->
+            val unescaped = m.groupValues[1]
+                .replace("&quot;", "\"").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">")
+            val flashvars = (parseJson(unescaped) as? JSONObject)?.optString("flashvars")
+            val metadata = flashvars?.let { (parseJson(it) as? JSONObject)?.optString("metadata") }
+            val meta = metadata?.let { parseJson(it) as? JSONObject }
+            meta?.optString("hlsManifestUrl")?.ifBlank { null }?.let {
+                emit(it, "https://ok.ru", callback)
+                count++
+            }
+            meta?.optJSONArray("videos")?.let { vids ->
+                for (i in 0 until vids.length()) {
+                    val v = vids.optJSONObject(i) ?: continue
+                    val url = v.optString("url")
+                    if (url.startsWith("http") && url.contains(".mp4", true)) {
+                        emit(url, "https://ok.ru", callback)
+                        count++
+                    }
+                }
+            }
+        }
+
+        if (count == 0) {
+            Regex(
+                """https?://[^"'<>\s]+\.(?:mp4|m3u8)(?:\?[^"'<>\s]*)?""",
+                RegexOption.IGNORE_CASE
+            ).findAll(page).forEach { m ->
+                emit(m.value, "https://ok.ru", callback)
+                count++
+            }
+        }
+        return count
+    }
 
     private suspend fun scrape(
         pageUrl: String,
@@ -586,13 +661,18 @@ class DonghuaFlixProvider : MainAPI() {
         return count
     }
 
-    private suspend fun emit(u: String, referer: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun emit(
+        u: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+        qualityHint: Int? = null,
+    ) {
         val type = when {
             u.contains(".m3u8", true) -> ExtractorLinkType.M3U8
             u.contains(".mpd", true) -> ExtractorLinkType.DASH
             else -> ExtractorLinkType.VIDEO
         }
-        val quality = when (
+        val quality = qualityHint ?: when (
             Regex("""(2160|1080|720|480|360|240)p""").find(u)?.groupValues?.get(1)?.toIntOrNull()
         ) {
             2160 -> Qualities.P2160.value
