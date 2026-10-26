@@ -64,7 +64,7 @@ class DonghuaFlixProvider : MainAPI() {
     // ── Utilidades ───────────────────────────────────────────────────────
 
     private suspend fun getText(url: String): String? = try {
-        app.get(url).text
+        app.get(url, timeout = 12L).text
     } catch (_: Exception) {
         null
     }
@@ -617,10 +617,10 @@ class DonghuaFlixProvider : MainAPI() {
                         callback(link)
                     }
                 }
-                // Primero la vía de descarga directa (MP4 firmado, suele ir
-                // mejor que los m3u8 de estos hosts), luego el scrapeo.
-                emitted += tryDownloadVariants(url, callback)
+                // Primero el scrapeo del player (1 peticion suele bastar),
+                // y solo si no suelta nada, la vía de descarga (mas peticiones).
                 emitted += scrape(url, depth, subtitleCallback, callback)
+                if (emitted == 0) emitted += tryDownloadVariants(url, callback)
             }
         }
         return emitted
@@ -633,10 +633,8 @@ class DonghuaFlixProvider : MainAPI() {
         val host = m.groupValues[1]
         val id = m.groupValues[2]
         if (id.length < 4) return 0
-        var count = 0
-        count += extractDownloadPage("https://$host/d/$id", callback)
-        if (count == 0) count += extractDownloadPage("https://$host/download/$id", callback)
-        if (count == 0) count += extractDownloadPage("https://$host/$id/download", callback)
+        var count = extractDownloadPage("https://$host/d/$id", callback)
+        if (count == 0) count = extractDownloadPage("https://$host/download/$id", callback)
         return count
     }
 
@@ -754,9 +752,8 @@ class DonghuaFlixProvider : MainAPI() {
                     .containsMatchIn(href)) variants.add(href)
         }
         if (variants.isNotEmpty()) {
-            var count = 0
-            for (v in variants) {
-                count += extractFinalDownload(v, callback)
+            for (v in variants.take(1)) {
+                val count = extractFinalDownload(v, callback)
                 if (count > 0) return count
             }
             return 0
@@ -897,7 +894,7 @@ class DonghuaFlixProvider : MainAPI() {
             emit(u, pageUrl, callback)
             count++
         }
-        candidates.forEach { link ->
+        candidates.take(4).forEach { link ->
             count += resolve(link, depth + 1, subtitleCallback, callback)
         }
         return count
