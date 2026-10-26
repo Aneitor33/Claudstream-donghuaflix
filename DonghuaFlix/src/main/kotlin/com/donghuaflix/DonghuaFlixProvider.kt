@@ -368,6 +368,16 @@ class DonghuaFlixProvider : MainAPI() {
                 ?: arrayKeys.firstNotNullOfOrNull { key ->
                     root.optJSONArray(key)?.let { entryIn(it, slug) }
                 }
+                ?: run {
+                    // Defensivo: buscar en CUALQUIER array de objetos del root
+                    // (por si el catálogo usa otra clave: movies, films, results...)
+                    val keys = root.keys()
+                    var found: JSONObject? = null
+                    while (keys.hasNext() && found == null) {
+                        found = root.optJSONArray(keys.next())?.let { entryIn(it, slug) }
+                    }
+                    found
+                }
         }
         is JSONArray -> entryIn(root, slug)
         else -> null
@@ -377,7 +387,8 @@ class DonghuaFlixProvider : MainAPI() {
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             if (o.optString("i") == slug || o.optString("s") == slug ||
-                o.optString("id") == slug || o.optString("slug") == slug
+                o.optString("id") == slug || o.optString("slug") == slug ||
+                o.optString("imdb") == slug
             ) return o
         }
         return null
@@ -415,12 +426,16 @@ class DonghuaFlixProvider : MainAPI() {
             val servers = LinkedHashSet<String>()
             serverUrlsIn(root.optJSONArray("servers")).forEach(servers::add)
             serverUrlsIn(d.optJSONArray("servers")).forEach(servers::add)
-            val dataUrl = when {
-                direct.startsWith("http") -> direct
-                servers.isNotEmpty() -> servers.joinToString("\n")
-                episodes.isNotEmpty() -> episodes.first().data
-                else -> url
-            }
+            // Las fichas publicadas traen sourceUrl (página de origen): es la
+            // red de seguridad cuando no hay servers/embebidos (p. ej. PelisPedia)
+            val sourceUrl = firstText(d, "sourceUrl").ifBlank { null }
+                ?.takeIf { it.startsWith("http") }
+            val parts = LinkedHashSet<String>()
+            if (direct.startsWith("http")) parts.add(direct)
+            parts.addAll(servers)
+            if (parts.isEmpty() && episodes.isNotEmpty()) parts.add(episodes.first().data)
+            if (sourceUrl != null) parts.add(sourceUrl)
+            val dataUrl = parts.joinToString("\n").ifBlank { url }
             newMovieLoadResponse(title, url, type, dataUrl) {
                 this.posterUrl = poster
                 this.plot = plot
@@ -472,6 +487,9 @@ class DonghuaFlixProvider : MainAPI() {
                 .ifBlank { null }?.let(urls::add)
             serverUrlsIn(o.optJSONArray("servers")).forEach(urls::add)
             serverUrlsIn(o.optJSONArray("sources")).forEach(urls::add)
+            // Red de seguridad: la página de origen del episodio
+            firstText(o, "sourceUrl").ifBlank { null }
+                ?.takeIf { it.startsWith("http") }?.let(urls::add)
             if (urls.isEmpty()) continue
             val num = firstIntOrNull(o, "number", "n", "num", "episode", "ep") ?: (i + 1)
             val rawName = firstText(o, "title", "t", "name", "label")
