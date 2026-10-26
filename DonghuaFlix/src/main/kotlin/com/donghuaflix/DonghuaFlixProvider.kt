@@ -702,7 +702,7 @@ class DonghuaFlixProvider : MainAPI() {
     }
 
     /** Busca m3u8/mp4 embebidos en un HTML (players tipo player.js). */
-    private fun grepMedia(page: String, referer: String, callback: (ExtractorLink) -> Unit): Int {
+    private suspend fun grepMedia(page: String, referer: String, callback: (ExtractorLink) -> Unit): Int {
         val found = LinkedHashSet<String>()
         listOf(
             Regex(
