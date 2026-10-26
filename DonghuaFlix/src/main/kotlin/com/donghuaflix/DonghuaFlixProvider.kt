@@ -411,41 +411,52 @@ class DonghuaFlixProvider : MainAPI() {
         val genres = (d.optJSONArray("genres") ?: d.optJSONArray("g"))?.let { arr ->
             (0 until arr.length()).mapNotNull { arr.optString(it).ifBlank { null } }
         }.orEmpty()
-        val type = typeOf(entry.copy(type = d.optString("type").ifBlank { null } ?: entry.type), idx)
-        val episodes = episodesIn(root, entry.slug, d.optString("id").ifBlank { entry.slug })
+        // El detalle publicado distingue movie/series (contentType)
+        val contentType = d.optString("contentType").lowercase()
+        val type = when {
+            "series" in contentType || "tvshow" in contentType || contentType == "tv" ->
+                TvType.TvSeries
 
-        return if (episodes.isNotEmpty() && type != TvType.Movie) {
-            newTvSeriesLoadResponse(title, url, type, episodes) {
-                this.posterUrl = poster
-                this.plot = plot
-                this.year = year
-                this.tags = genres
-            }
-        } else {
-            val direct = firstText(root, "url", "u", "link", "video", "src")
-            val servers = LinkedHashSet<String>()
-            serverUrlsIn(root.optJSONArray("servers")).forEach(servers::add)
-            serverUrlsIn(d.optJSONArray("servers")).forEach(servers::add)
-            // Las fichas publicadas traen sourceUrl (página de origen): es la
-            // red de seguridad cuando no hay servers/embebidos (p. ej. PelisPedia)
-            val sourceUrl = firstText(d, "sourceUrl").ifBlank { null }
-                ?.takeIf { it.startsWith("http") }
-            val parts = LinkedHashSet<String>()
-            if (direct.startsWith("http")) parts.add(direct)
-            parts.addAll(servers)
-            if (parts.isEmpty() && episodes.isNotEmpty()) parts.add(episodes.first().data)
-            if (sourceUrl != null) parts.add(sourceUrl)
-            val dataUrl = parts.joinToString("\n").ifBlank { url }
-            newMovieLoadResponse(title, url, type, dataUrl) {
+            "movie" in contentType || "film" in contentType -> TvType.Movie
+            else -> typeOf(entry.copy(type = d.optString("type").ifBlank { null } ?: entry.type), idx)
+        }
+        val episodes = episodesIn(root, entry.slug, d.optString("id").ifBlank { entry.slug })
+        val sourceUrl = firstText(d, "sourceUrl").ifBlank { null }
+            ?.takeIf { it.startsWith("http") }
+
+        if (episodes.isNotEmpty() && type != TvType.Movie) {
+            return newTvSeriesLoadResponse(title, url, type, episodes) {
                 this.posterUrl = poster
                 this.plot = plot
                 this.year = year
                 this.tags = genres
             }
         }
+
+        // Serie sin episodios publicados: rastrear la página de origen
+        if (type != TvType.Movie && sourceUrl != null) {
+            loadFromSource(sourceUrl)?.let { return it }
+        }
+
+        // Rama película (o serie empaquetada como película por la fuente)
+        val direct = firstText(root, "url", "u", "link", "video", "src")
+        val servers = LinkedHashSet<String>()
+        serverUrlsIn(root.optJSONArray("servers")).forEach(servers::add)
+        serverUrlsIn(d.optJSONArray("servers")).forEach(servers::add)
+        val parts = LinkedHashSet<String>()
+        if (direct.startsWith("http")) parts.add(direct)
+        parts.addAll(servers)
+        if (parts.isEmpty() && episodes.isNotEmpty()) parts.add(episodes.first().data)
+        if (sourceUrl != null) parts.add(sourceUrl)
+        val dataUrl = parts.joinToString("\n").ifBlank { url }
+        return newMovieLoadResponse(title, url, type, dataUrl) {
+            this.posterUrl = poster
+            this.plot = plot
+            this.year = year
+            this.tags = genres
+        }
     }
 
-    /** Recoge las URL de un array "servers"/"sources" ({name,url}). */
     private fun serverUrlsIn(arr: JSONArray?): List<String> {
         if (arr == null) return emptyList()
         val out = LinkedHashSet<String>()
@@ -606,8 +617,10 @@ class DonghuaFlixProvider : MainAPI() {
                         callback(link)
                     }
                 }
+                // Primero la vía de descarga directa (MP4 firmado, suele ir
+                // mejor que los m3u8 de estos hosts), luego el scrapeo.
+                emitted += tryDownloadVariants(url, callback)
                 emitted += scrape(url, depth, subtitleCallback, callback)
-                if (emitted == 0) emitted += tryDownloadVariants(url, callback)
             }
         }
         return emitted
