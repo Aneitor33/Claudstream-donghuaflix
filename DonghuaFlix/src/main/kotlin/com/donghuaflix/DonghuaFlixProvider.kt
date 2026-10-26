@@ -451,6 +451,15 @@ class DonghuaFlixProvider : MainAPI() {
         serverUrlsIn(root.optJSONArray("servers")).forEach(servers::add)
         serverUrlsIn(d.optJSONArray("servers")).forEach(servers::add)
         val parts = LinkedHashSet<String>()
+        // VixSrc (por TMDB) como primera opcion para peliculas: sin captcha
+        if (type == TvType.Movie) {
+            val tmdbId = firstText(d, "tmdbId", "tmdb_id", "tmdb", "t")
+            if (tmdbId.toIntOrNull() != null) {
+                parts.add("vixsrc:movie:$tmdbId")
+            } else if (tmdbApiKey.isNotBlank()) {
+                parts.add("vixsearch:movie:" + title.replace(":", " ") + ":" + (year ?: 0))
+            }
+        }
         if (direct.startsWith("http")) parts.add(direct)
         parts.addAll(servers)
         if (parts.isEmpty() && episodes.isNotEmpty()) parts.add(episodes.first().data)
@@ -583,6 +592,87 @@ class DonghuaFlixProvider : MainAPI() {
 
     // ── Reproducción ─────────────────────────────────────────────────────
 
+    // ── VixSrc: embed API por TMDB ID (sin captcha) ─────────────────────
+    // Consigue tu API key gratuita en themoviedb.org -> Ajustes -> API y
+    // pegala aqui. Solo se usa para buscar el TMDB ID por titulo/año.
+    private val tmdbApiKey = "TMDB_API_KEY_PLACEHOLDER"
+
+    /** vixsrc.to/api/{movie|tv} -> embed -> token -> master HLS. */
+    private suspend fun extractVixsrc(
+        tmdbId: String,
+        isMovie: Boolean,
+        season: Int?,
+        episode: Int?,
+        callback: (ExtractorLink) -> Unit,
+    ): Int {
+        val base = "https://vixsrc.to"
+        val h = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150 Safari/537.36",
+            "Accept" to "application/json, text/javascript, */*; q=0.01",
+            "Referer" to base,
+            "Origin" to base,
+        )
+        val apiUrl = if (isMovie) {
+            "$base/api/movie/$tmdbId"
+        } else {
+            "$base/api/tv/$tmdbId/${season ?: 1}/${episode ?: 1}"
+        }
+        val apiText = try {
+            app.get(apiUrl, headers = h, timeout = 12L).text
+        } catch (_: Exception) {
+            return 0
+        }
+        val srcPath = (parseJson(apiText) as? JSONObject)
+            ?.optString("src")?.ifBlank { null } ?: return 0
+
+        val html = try {
+            app.get(base + srcPath, headers = h, timeout = 12L).text
+        } catch (_: Exception) {
+            return 0
+        }
+        val token = Regex("""token["']?\s*:\s*["']([^"']+)""").find(html)?.groupValues?.get(1) ?: return 0
+        val expires = Regex("""expires["']?\s*:\s*["']([^"']+)""").find(html)?.groupValues?.get(1) ?: return 0
+        val playlist = Regex("""url\s*:\s*["']([^"']+)""").find(html)?.groupValues?.get(1) ?: return 0
+        if (expires.toLongOrNull()?.let { it * 1000 - 60_000 < System.currentTimeMillis() } == true) return 0
+
+        val sep = if (playlist.contains("?")) "&" else "?"
+        val master = playlist + sep + "token=" + token + "&expires=" + expires + "&h=1"
+        emit(master, apiUrl, callback, Qualities.P1080.value)
+        return 1
+    }
+
+    private suspend fun tmdbSearchId(title: String, year: Int?, isMovie: Boolean): String? {
+        if (tmdbApiKey.isBlank()) return null
+        val type = if (isMovie) "movie" else "tv"
+        val url = "https://api.themoviedb.org/3/search/$type?api_key=$tmdbApiKey" +
+                "&query=" + URLEncoder.encode(title, "UTF-8") +
+                "&language=es" + (year?.let { "&year=$it" } ?: "")
+        val text = getText(url) ?: return null
+        val arr = (parseJson(text) as? JSONObject)?.optJSONArray("results") ?: return null
+        return (0 until minOf(arr.length(), 3)).firstNotNullOfOrNull { i ->
+            arr.optJSONObject(i)?.optInt("id")?.takeIf { it > 0 }?.toString()
+        }
+    }
+
+    /** Marcadores en dataUrl: "vixsrc:movie:ID" / "vixsearch:movie:Titulo:Ano". */
+    private suspend fun resolveMarker(raw: String, callback: (ExtractorLink) -> Unit): Int {
+        val parts = raw.split(":")
+        return when {
+            parts.size >= 3 && parts[0] == "vixsrc" -> {
+                val isMovie = parts[1] == "movie"
+                extractVixsrc(parts[2], isMovie, parts.getOrNull(3)?.toIntOrNull(), parts.getOrNull(4)?.toIntOrNull(), callback)
+            }
+            parts.size >= 4 && parts[0] == "vixsearch" -> {
+                val isMovie = parts[1] == "movie"
+                val title = parts.drop(2).dropLast(1).joinToString(":")
+                val year = parts.last().toIntOrNull()
+                val id = tmdbSearchId(title, year, isMovie) ?: return 0
+                extractVixsrc(id, isMovie, null, null, callback)
+            }
+            else -> 0
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -593,7 +683,11 @@ class DonghuaFlixProvider : MainAPI() {
         val urls = data.lines().map { it.trim() }.filter { it.startsWith("http") }.distinct()
         if (urls.isEmpty()) return false
         for (raw in urls) {
-            emitted += resolve(raw, 0, subtitleCallback, callback)
+            if (raw.startsWith("vixsrc:") || raw.startsWith("vixsearch:")) {
+                emitted += resolveMarker(raw, callback)
+            } else {
+                emitted += resolve(raw, 0, subtitleCallback, callback)
+            }
         }
         return emitted > 0
     }
