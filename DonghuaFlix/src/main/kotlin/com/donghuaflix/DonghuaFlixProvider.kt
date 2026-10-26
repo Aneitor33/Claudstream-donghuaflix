@@ -739,16 +739,39 @@ class DonghuaFlixProvider : MainAPI() {
      * en el HTML/JS. Los candidatos se resuelven recursivamente (límite de
      * profundidad) pasando por los extractores registrados de CloudStream.
      */
-    /** Páginas de descarga de Streamwish/Earnvids/VidHide: baile de
-     *  formularios (op=download1 -> op=download2) hasta revelar el enlace
-     *  firmado (#download_link). El enlace va firmado para la IP que pide. */
+    /** Páginas de descarga de Streamwish/Earnvids/VidHide.
+     *  Flujo real: /d/ID -> selector de calidad (/f/ID_h...) -> página
+     *  "Download File" donde el enlace firmado sale por formulario o por
+     *  token incrustado en el JS (cuenta atrás solo cosmética). */
     private suspend fun extractDownloadPage(u: String, callback: (ExtractorLink) -> Unit): Int {
+        val first = getText(u) ?: return 0
+
+        // Selector de calidad: enlaces tipo /f/ID_h, /download/ID_n...
+        val variants = LinkedHashSet<String>()
+        Jsoup.parse(first, u).select("a[href]").forEach { a ->
+            val href = a.absUrl("href")
+            if (Regex("""/(?:f|download)/[\w-]+_[a-z]$""", RegexOption.IGNORE_CASE)
+                    .containsMatchIn(href)) variants.add(href)
+        }
+        if (variants.isNotEmpty()) {
+            var count = 0
+            for (v in variants) {
+                count += extractFinalDownload(v, callback)
+                if (count > 0) return count
+            }
+            return 0
+        }
+        return extractFinalDownload(u, callback)
+    }
+
+    /** Página final "Download File": extrae el enlace firmado. */
+    private suspend fun extractFinalDownload(u: String, callback: (ExtractorLink) -> Unit): Int {
         var page = getText(u) ?: return 0
         var current = u
         var count = grepMedia(page, current, callback)
         if (count > 0) return count
 
-        repeat(2) { step ->
+        repeat(3) { step ->
             val doc = Jsoup.parse(page, current)
             doc.selectFirst("#download_link")?.let { a ->
                 val href = a.absUrl("href").replace("&amp;", "&")
@@ -757,21 +780,24 @@ class DonghuaFlixProvider : MainAPI() {
                     return count + 1
                 }
             }
-            val form = doc.selectFirst("form") ?: return 0
-            val action = form.absUrl("action").ifBlank { current }
-            val data = LinkedHashMap<String, String>()
-            form.select("input[name]").forEach { inp ->
-                data[inp.attr("name")] = inp.attr("value")
+            // token: input oculto o variable JS de la página
+            var token = doc.selectFirst("input[name=token]")?.attr("value")
+            if (token.isNullOrBlank()) {
+                token = listOf(
+                    Regex("""token['"]?\s*[:=]\s*['"]([^'"]+)['"]?"""),
+                    Regex("""(?:var|let|const)\s+\w*tok\w*\s*=\s*['"]([^'"]+)"""),
+                ).firstNotNullOfOrNull { rx -> rx.find(page)?.groupValues?.get(1) }
             }
-            if (data.isEmpty()) return 0
-            if (!data.containsKey("op")) data["op"] = "download${step + 1}"
+            if (token.isNullOrBlank()) return 0
 
             page = try {
-                app.post(action, data = data).text
+                app.post(current, data = mapOf(
+                    "op" to "download${step + 1}",
+                    "token" to token,
+                )).text
             } catch (_: Exception) {
                 return 0
             }
-            current = action
             count = grepMedia(page, current, callback)
             if (count > 0) return count
         }
