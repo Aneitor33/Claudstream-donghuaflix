@@ -1,0 +1,25 @@
+[
+    {
+        "iconUrl": "https://raw.githubusercontent.com/Aneitor33/donghuaflix/main/icon-192.png",
+        "fileHash": "sha256-4863eea70f153dd7a916673d7eee5938de701f74e8fe097a0f98f4a2593ad40f",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Aneitor33/Claudstream-donghuaflix",
+        "fileSize": 70074,
+        "status": 1,
+        "language": "es",
+        "authors": [
+            "Aneitor33"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AsianDrama",
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 16,
+        "internalName": "DonghuaFlix",
+        "description": "Cat\u00e1logos h\u00edbridos de DonghuaFlix: Donghua Life, DonghuaSub, Doramas, Dramas YouTube, YouTube Films y PelisPedia",
+        "url": "https://raw.githubusercontent.com/Aneitor33/Claudstream-donghuaflix/builds/DonghuaFlix.cs3",
+        "name": "DonghuaFlix"
+    }
+]
